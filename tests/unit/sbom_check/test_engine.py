@@ -416,3 +416,274 @@ def test_document_namespace_fragment_prohibited():
     assert len(fragment_errors) > 0, (
         "Fragment identifiers should be prohibited in documentNamespace"
     )
+
+
+def test_license_expression_error_accepts_valid_expressions():
+    """Valid SPDX ids, compound expressions, and sentinels are accepted."""
+    engine = SbomCheckEngine()
+
+    for value in [
+        "MIT",
+        "MIT OR Apache-2.0",
+        "Apache-2.0 WITH LLVM-exception",
+        "NOASSERTION",
+        "NONE",
+        "",
+    ]:
+        assert engine._license_expression_error(value, set(), set()) is None, value
+
+
+def test_license_expression_error_reports_free_text_as_unknown():
+    """Free-form license names that are not SPDX ids are reported as unknown."""
+    engine = SbomCheckEngine()
+
+    detail = engine._license_expression_error("BSD", set(), set())
+    assert detail is not None
+    assert detail.startswith("unknown or undeclared license id(s):")
+    assert "BSD" in detail
+
+    detail = engine._license_expression_error("Public Domain", set(), set())
+    assert "Public Domain" in detail
+
+
+def test_license_expression_error_reports_syntax_errors():
+    """A syntactically malformed expression is classified as a syntax error."""
+    engine = SbomCheckEngine()
+
+    for value in ["MIT AND", "(MIT", "()", "MIT/Apache-2.0"]:
+        detail = engine._license_expression_error(value, set(), set())
+        assert detail is not None, value
+        assert detail.startswith("syntax error:"), (value, detail)
+
+
+def test_license_expression_error_reports_misused_exception():
+    """A plain license used as a WITH exception is classified as misuse."""
+    engine = SbomCheckEngine()
+
+    for value in ["MIT WITH Apache-2.0", "Apache-2.0 WITH MIT"]:
+        detail = engine._license_expression_error(value, set(), set())
+        assert detail is not None, value
+        assert detail.startswith("misused license/exception:"), (value, detail)
+
+
+def test_license_expression_error_reports_exception_without_with():
+    """A bare exception id (no WITH) is reported, not silently accepted."""
+    engine = SbomCheckEngine()
+
+    detail = engine._license_expression_error(
+        "Classpath-exception-2.0", set(), set()
+    )
+    assert detail is not None
+    assert detail.startswith("misused license/exception:")
+
+
+def test_license_expression_error_rejects_noassertion_in_compound():
+    """NOASSERTION/NONE are only valid standalone, not inside a compound."""
+    engine = SbomCheckEngine()
+
+    detail = engine._license_expression_error("MIT AND NOASSERTION", set(), set())
+    assert detail is not None
+    assert "NOASSERTION" in detail
+
+
+def test_license_expression_error_license_ref_requires_declaration():
+    """A LicenseRef- id is accepted only when declared, otherwise reported."""
+    engine = SbomCheckEngine()
+
+    declared = {"LicenseRef-foo"}
+    assert engine._license_expression_error("LicenseRef-foo", declared, set()) is None
+    assert (
+        engine._license_expression_error("MIT AND LicenseRef-foo", declared, set())
+        is None
+    )
+    assert (
+        engine._license_expression_error("LicenseRef-bar", declared, set()) is not None
+    )
+    assert engine._license_expression_error("LicenseRef-foo", set(), set()) is not None
+
+
+def test_license_expression_error_native_license_ref_requires_declaration():
+    """Parser-known LicenseRef- ids (e.g. scancode) still require declaration."""
+    engine = SbomCheckEngine()
+
+    ref = "LicenseRef-scancode-public-domain"
+    assert engine._license_expression_error(ref, set(), set()) is not None
+    assert engine._license_expression_error(ref, {ref}, set()) is None
+
+
+def test_license_expression_error_rejects_license_ref_as_exception():
+    """A declared LicenseRef- used as a WITH exception is still rejected."""
+    engine = SbomCheckEngine()
+
+    detail = engine._license_expression_error(
+        "MIT WITH LicenseRef-foo", {"LicenseRef-foo"}, set()
+    )
+    assert detail is not None
+    assert detail.startswith("misused license/exception:")
+
+
+def test_license_expression_error_document_ref_requires_external_doc():
+    """DocumentRef-...:LicenseRef-... is accepted only for a declared external doc."""
+    engine = SbomCheckEngine()
+
+    value = "DocumentRef-spdx-tool:LicenseRef-mylic"
+    # Not declared in externalDocumentRefs -> reported.
+    assert engine._license_expression_error(value, set(), set()) is not None
+    # Declared -> accepted without resolving the external document.
+    assert (
+        engine._license_expression_error(value, set(), {"DocumentRef-spdx-tool"})
+        is None
+    )
+
+
+def test_validate_package_licenses_reports_invalid_fields():
+    """Invalid licenseConcluded/licenseDeclared values produce errors."""
+    engine = SbomCheckEngine()
+    result = SbomCheckResult(overall_valid=True, spdx_valid=True, profile_valid=True)
+
+    package = {
+        "SPDXID": "SPDXRef-Package-0",
+        "licenseConcluded": "MIT",
+        "licenseDeclared": "Public Domain",
+    }
+    engine._validate_package_licenses(package, 0, set(), set(), result)
+
+    errors = [
+        msg for msg in result.messages if msg.rule_id == "invalid_license_expression"
+    ]
+    assert len(errors) == 1
+    assert "licenseDeclared" in errors[0].field_path
+
+
+def test_validate_package_licenses_skips_missing_fields():
+    """Packages without license fields produce no license errors."""
+    engine = SbomCheckEngine()
+    result = SbomCheckResult(overall_valid=True, spdx_valid=True, profile_valid=True)
+
+    engine._validate_package_licenses(
+        {"SPDXID": "SPDXRef-Package-0"}, 0, set(), set(), result
+    )
+
+    assert result.messages == []
+
+
+def test_validate_package_licenses_reports_non_string_value():
+    """A non-string license value is reported as a type error, not a bad symbol."""
+    engine = SbomCheckEngine()
+    result = SbomCheckResult(overall_valid=True, spdx_valid=True, profile_valid=True)
+
+    package = {"SPDXID": "SPDXRef-Package-0", "licenseConcluded": ["MIT"]}
+    engine._validate_package_licenses(package, 0, set(), set(), result)
+
+    errors = [
+        msg for msg in result.messages if msg.rule_id == "invalid_license_expression"
+    ]
+    assert len(errors) == 1
+    assert "must be a string" in errors[0].message
+
+
+def test_validate_package_licenses_warns_on_lowercase_operator():
+    """A valid expression with lowercase operators yields a WARNING, not an ERROR."""
+    engine = SbomCheckEngine()
+    result = SbomCheckResult(overall_valid=True, spdx_valid=True, profile_valid=True)
+
+    package = {"SPDXID": "SPDXRef-Package-0", "licenseConcluded": "MIT and Apache-2.0"}
+    engine._validate_package_licenses(package, 0, set(), set(), result)
+
+    assert not [
+        msg for msg in result.messages if msg.rule_id == "invalid_license_expression"
+    ]
+    warnings = [
+        msg for msg in result.messages if msg.rule_id == "lowercase_license_operator"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].severity == ValidationSeverity.WARNING
+
+
+def test_validate_package_requirements_validates_licenses_in_default_profile():
+    """The default profile flags invalid license expressions on packages."""
+    engine = SbomCheckEngine()  # default profile
+    result = SbomCheckResult(overall_valid=True, spdx_valid=True, profile_valid=True)
+
+    spdx_data = {
+        "packages": [
+            {
+                "SPDXID": "SPDXRef-Package-0",
+                "name": "pkg",
+                "licenseConcluded": "NotA License",
+                "licenseDeclared": "LicenseRef-custom",
+            }
+        ],
+        "hasExtractedLicensingInfos": [{"licenseId": "LicenseRef-custom"}],
+    }
+    engine._validate_package_requirements(spdx_data, result)
+
+    license_errors = [
+        msg for msg in result.messages if msg.rule_id == "invalid_license_expression"
+    ]
+    # Only the free-text licenseConcluded is invalid; the declared LicenseRef- is fine.
+    assert len(license_errors) == 1
+    assert "licenseConcluded" in license_errors[0].field_path
+
+
+def test_validate_package_requirements_accepts_external_document_ref():
+    """A DocumentRef- declared in externalDocumentRefs is accepted end-to-end."""
+    engine = SbomCheckEngine()  # default profile
+    result = SbomCheckResult(overall_valid=True, spdx_valid=True, profile_valid=True)
+
+    spdx_data = {
+        "packages": [
+            {
+                "SPDXID": "SPDXRef-Package-0",
+                "name": "pkg",
+                "licenseConcluded": "DocumentRef-ext:LicenseRef-x",
+            }
+        ],
+        "externalDocumentRefs": [{"externalDocumentId": "DocumentRef-ext"}],
+    }
+    engine._validate_package_requirements(spdx_data, result)
+
+    assert not [
+        msg for msg in result.messages if msg.rule_id == "invalid_license_expression"
+    ]
+
+
+def test_validate_package_requirements_tolerates_malformed_extracted_infos():
+    """Malformed hasExtractedLicensingInfos must not crash (default profile)."""
+    engine = SbomCheckEngine()  # default profile, flag on
+    for bad in (None, {"not": "a list"}, [{"licenseId": ["a"]}], ["string"]):
+        result = SbomCheckResult(
+            overall_valid=True, spdx_valid=True, profile_valid=True
+        )
+        spdx_data = {
+            "packages": [{"SPDXID": "SPDXRef-Package-0", "licenseDeclared": "MIT"}],
+            "hasExtractedLicensingInfos": bad,
+        }
+        # Must not raise.
+        engine._validate_package_requirements(spdx_data, result)
+        assert not [
+            msg
+            for msg in result.messages
+            if msg.rule_id == "invalid_license_expression"
+        ], bad
+
+
+def test_validate_package_requirements_basic_profile_skips_and_tolerates():
+    """basic_spdx (flag off) emits no license messages and never crashes on bad input."""
+    engine = SbomCheckEngine(profile_name="basic_spdx")
+    result = SbomCheckResult(overall_valid=True, spdx_valid=True, profile_valid=True)
+
+    spdx_data = {
+        "packages": [
+            {"SPDXID": "SPDXRef-Package-0", "licenseDeclared": "Public Domain"}
+        ],
+        # Malformed values that would crash if the feature touched them.
+        "hasExtractedLicensingInfos": None,
+        "externalDocumentRefs": {"bad": "shape"},
+    }
+    engine._validate_package_requirements(spdx_data, result)
+
+    assert not [
+        msg for msg in result.messages if msg.rule_id == "invalid_license_expression"
+    ]
+
