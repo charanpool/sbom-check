@@ -32,6 +32,8 @@ dependencies = [
     "rich>=13.0.0",
     "jinja2>=3.1.0",
     "requests>=2.32.0",
+    # Canonical SPDX license-expression parser for license field validation.
+    "license-expression>=30.4,<31",
     # spdx-validator dependencies
     "jsonschema>=4.25.1",
     # CycloneDX dependencies
@@ -73,6 +75,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 spdx_validator = ["data/*.json"]
+sbom_check = ["data/*"]
 
 [tool.setuptools_scm]
 version_scheme = "guess-next-dev"
@@ -141,6 +144,7 @@ show_error_codes = true
 [[tool.mypy.overrides]]
 module = [
     "sbom_check._version",
+    "license_expression",
 ]
 ignore_missing_imports = true
 
